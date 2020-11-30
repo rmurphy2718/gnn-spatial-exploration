@@ -1,0 +1,155 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Pre-processing the data in R
+
+We begin by loading the California Precipitation data, which is available in R's `spatial` package.  The data contains monthly precipitation, altitude, and geocodes (latitude/longitude) for 456 locations in California.
+
+```{r}
+library(rspatial)
+p <- sp_data('precipitation')
+print(dim(p))
+print(head(p[, c("NAME", "LAT", "LONG", "ALT", "JAN", "DEC")]))
+```
+
+As in Section 6.1 of [Spacial Data Analysis with R](https://rspatial.org/raster/analysis/analysis.pdf), our goal will be to predict the annual preciptiation, so we sum across the 12 months.  We then scale our only location (vertex) feature, altitude.  This completes the intial processing of the data, so we also shuffle the rows.
+
+```{r}
+p$pan <-rowSums(p[,6:17])  
+p$scaled.alt <- scale(p$ALT)
+
+# Shuffle dataset
+set.seed(42)
+n <- nrow(p)
+p <- p[sample(n), ]
+```
+
+## Exploiting spatial information by building a graph 
+In the textbook mentioned above, the authors use local regression to exploit spacial information when predicting rainfall.  I thought it would be fun to try something similar with a Graph Neural Network.
+
+So, we will build a graph where the locations are vertices and edges are formed between each location and its closest neighbors.  Our first step, then, is to build a pairwise distance matrix: for every pair of locations, we need the distance.
+
+I found a function that takes in latitude/longitude and returns distances from the blog at [exploratory.io](https://exploratory.io/).
+
+```{r}
+# We need the following helper function from exploratory,
+# which we can simply copy-and-paste or obtain by installing their software.
+# https://rdrr.io/github/exploratory-io/exploratory_func/src/R/util.R#sym-list_extract
+list_extract <- function(column, position = 1, rownum = 1){
+  
+  if(position==0){
+    stop("position 0 is not supported")
+  }
+  
+  if(is.data.frame(column[[1]])){
+    if(position<0){
+      sapply(column, function(column){
+        index <- ncol(column) + position + 1
+        if(is.null(column[rownum, index]) | index <= 0){
+          # column[rownum, position] still returns data frame if it's minus, so position < 0 should be caught here
+          NA
+        } else {
+          column[rownum, index][[1]]
+        }
+      })
+    } else {
+      sapply(column, function(column){
+        if(is.null(column[rownum, position])){
+          NA
+        } else {
+          column[rownum, position][[1]]
+        }
+      })
+    }
+  } else {
+    if(position<0){
+      sapply(column, function(column){
+        index <- length(column) + position + 1
+        if(index <= 0){
+          # column[rownum, position] still returns data frame if it's minus, so position < 0 should be caught here
+          NA
+        } else {
+          column[index]
+        }
+      })
+    } else {
+      sapply(column, function(column){
+        column[position]
+      })
+    }
+  }
+}
+
+# Here is the function that computes distance.
+# https://blog.exploratory.io/calculating-distances-between-two-geo-coded-locations-358e65fcafae
+get_geo_distance = function(long1, lat1, long2, lat2, units = "miles") {
+  loadNamespace("purrr")
+  loadNamespace("geosphere")
+  longlat1 = purrr::map2(long1, lat1, function(x,y) c(x,y))
+  longlat2 = purrr::map2(long2, lat2, function(x,y) c(x,y))
+  distance_list = purrr::map2(longlat1, longlat2, function(x,y) geosphere::distHaversine(x, y))
+  distance_m = list_extract(distance_list, position = 1)
+  if (units == "km") {
+    distance = distance_m / 1000.0;
+  }
+  else if (units == "miles") {
+    distance = distance_m / 1609.344
+  }
+  else {
+    distance = distance_m
+    # This will return in meter as same way as distHaversine function. 
+  }
+  distance
+}
+```
+
+Now, to compute the distance matrix, I loop over all pairs of locations and apply this function.  It was not obvious to me that there's a cleaner way than to loop here, but I would love to hear from readers with suggestions.
+
+```{r}
+# Create distance matrix
+distances <- matrix(nrow = n, ncol = n, data = -1)
+colnames(distances) <- p$NAME
+rownames(distances) <- p$NAME
+
+for(ii in 1:n){
+  for(jj in 1:ii){
+    if(ii == jj){
+      distances[ii, ii] <- 0.0 
+    }else{
+      distances[ii, jj] <- get_geo_distance(long1=p$LONG[ii], lat1=p$LAT[ii],
+                                            long2=p$LONG[jj], lat2=p$LAT[jj],
+                                            units='km')
+      distances[jj, ii] <- distances[ii, jj]      
+    }
+  }
+}
+```
+
+A summary of the distance matrix:
+```{r}
+summary(as.numeric(distances))
+```
+
+Equiped with the distance matrix, we can use the `nng` (nearest neighbor graphs) function from `cccd`:
+```{r}
+library(cccd)
+library(igraph)
+g <- as.undirected(
+  nng(dx=distances, k=5, mutual=FALSE)
+)
+```
+
+## Exporting the data
+Finally, we save these to disk for processing in python/PyTorch-Geometric.  They will go to a "raw" directory, per the convention of PyTorch-Geomtric's customized datasets.
+
+```{r}
+write.csv(p$pan, file='raw/targets.csv')
+write.csv(p$scaled.alt, file='raw/features.csv')
+
+# Save graph as a graphml so it can be loaded by networkx.
+write_graph(g, file = 'raw/ca_distance_graph.graphml', format = 'graphml')
+```
