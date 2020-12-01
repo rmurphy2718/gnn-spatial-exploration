@@ -2,7 +2,7 @@
 title: " "
 output:
   md_document:
-    variant: markdown_github
+    variant: gfm
 ---
 
 # Obtain and pre-process the data in R
