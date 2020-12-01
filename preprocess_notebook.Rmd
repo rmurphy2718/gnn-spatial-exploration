@@ -1,26 +1,29 @@
 ---
-title: "R Notebook"
+title: " "
 output:
-  html_document:
-    df_print: paged
+  md_document:
+    variant: markdown_github
 ---
 
-# Pre-processing the data in R
+# Obtain and pre-process the data in R
 
-We begin by loading the California Precipitation data, which is available in R's `spatial` package.  The data contains monthly precipitation, altitude, and geocodes (latitude/longitude) for 456 locations in California.
+The California precipitation data is available in R's `spatial` package.  The data contains monthly precipitation, altitude, and geocodes (latitude/longitude) for 456 locations. 
 
+```{r,message=FALSE}
+library("rspatial")
+```
 ```{r}
-library(rspatial)
-p <- sp_data('precipitation')
+p <- sp_data("precipitation")
 print(dim(p))
+print(names(p))
 print(head(p[, c("NAME", "LAT", "LONG", "ALT", "JAN", "DEC")]))
 ```
 
-As in Section 6.1 of [Spacial Data Analysis with R](https://rspatial.org/raster/analysis/analysis.pdf), our goal will be to predict the annual preciptiation, so we sum across the 12 months.  We then scale our only location (vertex) feature, altitude.  This completes the intial processing of the data, so we also shuffle the rows.
+In Section 6.1 of [Spatial Data Analysis with R](https://rspatial.org/raster/analysis/analysis.pdf) the authors predict the annual precipitation from altitude and relational spatial information.  Following their analysis, we sum across the 12 months to create the target variable.  Additionally, to pre-process for deep learning, we scale our only non-relational feature, altitude, and shuffle the rows.
 
 ```{r}
-p$pan <-rowSums(p[,6:17])  
-p$scaled.alt <- scale(p$ALT)
+p$pan <-rowSums(p[,6:17])  # Columns 6:17 are Jan - Dec
+p$scaled.alt <- scale(p$ALT)  # "0-mean 1-std" standardization for simplicity
 
 # Shuffle dataset
 set.seed(42)
@@ -29,15 +32,17 @@ p <- p[sample(n), ]
 ```
 
 ## Exploiting spatial information by building a graph 
-In the textbook mentioned above, the authors use local regression to exploit spacial information when predicting rainfall.  I thought it would be fun to try something similar with a Graph Neural Network.
 
-So, we will build a graph where the locations are vertices and edges are formed between each location and its closest neighbors.  Our first step, then, is to build a pairwise distance matrix: for every pair of locations, we need the distance.
+In the textbook mentioned above, the authors use local regression to exploit spatial information when predicting rainfall.  I thought it would be fun to try to leverage spatial relational information with a graph neural network.
 
-I found a function that takes in latitude/longitude and returns distances from the blog at [exploratory.io](https://exploratory.io/).
+So, we will build a graph where the locations are vertices and edges are formed between nearest locations.  Our first step, then, is to build a pairwise distance matrix that stores the distance between every pair of locations.
+
+I found a function that takes in a pair of latitudes/longitudes and returns distances from the blog at [exploratory.io](https://exploratory.io/).  
 
 ```{r}
-# We need the following helper function from exploratory,
+# We need the following helper function from exploratory.io,
 # which we can simply copy-and-paste or obtain by installing their software.
+# (I didn't feel like updating my dependencies etc. for one function)
 # https://rdrr.io/github/exploratory-io/exploratory_func/src/R/util.R#sym-list_extract
 list_extract <- function(column, position = 1, rownum = 1){
   
@@ -107,23 +112,23 @@ get_geo_distance = function(long1, lat1, long2, lat2, units = "miles") {
 }
 ```
 
-Now, to compute the distance matrix, I loop over all pairs of locations and apply this function.  It was not obvious to me that there's a cleaner way than to loop here, but I would love to hear from readers with suggestions.
+Now, to compute the distance matrix, I loop over all pairs of locations and apply this function.  I could not immediately think of a solution that would be cleaner than looping in this case, but I welcome ideas from readers!
 
-```{r}
-# Create distance matrix
+```{r, cache=TRUE}
+# Create distance matrix (this takes a few moments, unsurprisingly)
 distances <- matrix(nrow = n, ncol = n, data = -1)
 colnames(distances) <- p$NAME
 rownames(distances) <- p$NAME
 
 for(ii in 1:n){
-  for(jj in 1:ii){
+  for(jj in 1:ii){  # Can't run jj to (ii-1). For ii==1, this would yield sequence (1, 0).
     if(ii == jj){
-      distances[ii, ii] <- 0.0 
+      distances[ii, ii] <- 0.0
     }else{
       distances[ii, jj] <- get_geo_distance(long1=p$LONG[ii], lat1=p$LAT[ii],
                                             long2=p$LONG[jj], lat2=p$LAT[jj],
                                             units='km')
-      distances[jj, ii] <- distances[ii, jj]      
+      distances[jj, ii] <- distances[ii, jj]
     }
   }
 }
@@ -131,22 +136,41 @@ for(ii in 1:n){
 
 A summary of the distance matrix:
 ```{r}
-summary(as.numeric(distances))
+summary(as.numeric(distances))  # The min should be 0, not -1.
 ```
 
-Equiped with the distance matrix, we can use the `nng` (nearest neighbor graphs) function from `cccd`:
+**Double check**
+It's always good to double-check the data.  I found an online tool that computes the distance "as the crow flies" between locations and spot-checked two pairs.  Both checks match within a few KM.  We don't expect an exact match since many pairs of latitude/longitude can originate from the same city, and it may not be the case that the web tool uses exactly the same geocodes as in the precipitation data.
 ```{r}
-library(cccd)
-library(igraph)
-g <- as.undirected(
-  nng(dx=distances, k=5, mutual=FALSE)
-)
+# Compare with https://www.freemaptools.com/how-far-is-it-between.htm
+print(distances['PARADISE', 'SANTA CLARA         USA'])
+print(distances['BIG SUR             USA', 'LONG BEACH, CA   11'])
 ```
+
+Equipped with the distance matrix, we can use the `nng` (nearest neighbor graphs) function from `cccd`.  The value of $k$, the number of nearest neighbors is undoubtedly an important hyperparameter, but I simply chose 5 for now.  I will update if I come back to this.
+```{r, message=FALSE}
+library("cccd")
+library("igraph")
+```
+```{r}
+g <- as.undirected(
+  nng(dx=distances, k=5, mutual=FALSE)   # (mutual=FALSE then undirected) != using mutual=TRUE)
+)
+
+# Another sanity-check:
+neighbor.idx <- neighbors(g, 1, "all")  # indices of locations nearest to 1, per the graph
+closest.idx <- order(distances[1, ])[2:6]  # indices of locations nearest to 1, per distance mat
+all(sort(neighbor.idx) == sort(closest.idx))  # compare after sorting (igraph returns arbitrary order)
+```
+
+Note, `nng` does not force all vertices to have exactly 5 edges, so it is not a regular graph.
+
 
 ## Exporting the data
-Finally, we save these to disk for processing in python/PyTorch-Geometric.  They will go to a "raw" directory, per the convention of PyTorch-Geomtric's customized datasets.
+Finally, we save these to disk for processing in python/PyTorch-Geometric.
 
 ```{r}
+# Write to "raw" directory, per convention of PyTorch-Geomtric.
 write.csv(p$pan, file='raw/targets.csv')
 write.csv(p$scaled.alt, file='raw/features.csv')
 
